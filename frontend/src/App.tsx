@@ -1,10 +1,12 @@
 import { NavLink, Outlet } from 'react-router-dom'
-import { Layout, Menu, Statistic, Typography } from 'antd'
+import { Layout, Menu, Statistic, Tag, Typography } from 'antd'
 import { usePersistentStore } from '@/hooks/usePersistentStore'
 import { orchardStore } from '@/stores/orchardStore'
 import { colonyStore } from '@/stores/colonyStore'
 import { droppointStore } from '@/stores/droppointStore'
 import { routeStore } from '@/stores/routeStore'
+import { scheduleStore } from '@/stores/scheduleStore'
+import { staleDropPointIds } from '@/utils/schedule'
 
 const { Sider, Header, Content } = Layout
 
@@ -22,8 +24,10 @@ export default function AppLayout(): JSX.Element {
   const colonies = usePersistentStore(colonyStore, (state) => state.rows)
   const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
   const routes = usePersistentStore(routeStore, (state) => state.rows)
+  const basis = usePersistentStore(scheduleStore, (state) => state.basis)
 
   const totalKm = Math.round(routes.reduce((sum, item) => sum + item.distanceKm, 0) * 100) / 100
+  const staleCount = staleDropPointIds(orchards, dropPoints, basis).size
 
   return (
     <Layout className="app-shell">
@@ -48,6 +52,15 @@ export default function AppLayout(): JSX.Element {
           <Statistic title={<span style={{ color: '#a9b3ad', fontSize: 12 }}>已入册地块</span>} value={orchards.length} valueStyle={{ color: '#f2c14e' }} />
           <Statistic title={<span style={{ color: '#a9b3ad', fontSize: 12 }}>蜂群 / 投放点</span>} value={`${colonies.length} / ${dropPoints.length}`} valueStyle={{ color: '#f2c14e', fontSize: 18 }} />
           <Statistic title={<span style={{ color: '#a9b3ad', fontSize: 12 }}>转场里程合计</span>} value={`${totalKm} km`} valueStyle={{ color: '#f2c14e', fontSize: 18 }} />
+          {staleCount > 0 ? (
+            <div style={{ marginTop: 10 }}>
+              <NavLink to="/">
+                <Tag color="red" style={{ cursor: 'pointer' }}>
+                  {staleCount} 处排程待重算
+                </Tag>
+              </NavLink>
+            </div>
+          ) : null}
           <Typography.Paragraph style={{ color: '#7f8d82', fontSize: 11, marginTop: 12, marginBottom: 0 }}>
             数据保存在浏览器 IndexedDB，无需后端服务
           </Typography.Paragraph>

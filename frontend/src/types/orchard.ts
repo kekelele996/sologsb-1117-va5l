@@ -28,6 +28,11 @@ export interface Orchard {
   /** 历史授粉年份 */
   historyYears: number[]
   note: string
+  /**
+   * 托管队数据修订号：可达性变更时 +1。
+   * 排程重算基准里记录的修订号与当前不一致 → 引用本地块的排程失效待重算。
+   */
+  revision: number
 }
 
 /** 由面积与需蜂强度算出建议箱数（向上取整，最少 1 箱） */

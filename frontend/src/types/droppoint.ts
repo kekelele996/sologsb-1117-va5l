@@ -18,6 +18,11 @@ export interface DropPoint {
   withdrawTime: string
   /** 责任人 */
   owner: string
-  /** 该投放点安排的群号（用于冲突判定） */
+  /** 该投放点安排的群号（用于冲突判定与占用折算） */
   colonyCodes: string[]
+  /**
+   * 托管队数据修订号：可容纳箱数变更时 +1。
+   * 排程重算基准里记录的修订号与当前不一致 → 引用本点的排程失效待重算。
+   */
+  revision: number
 }

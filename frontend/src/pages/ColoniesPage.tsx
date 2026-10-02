@@ -1,18 +1,23 @@
 import { useMemo, useState } from 'react'
-import { Button, Card, Col, DatePicker, Form, Input, InputNumber, Modal, Row, Select, Slider, Space, Table, Tag, Typography, message } from 'antd'
+import { Alert, Button, Card, Col, DatePicker, Form, Input, InputNumber, Modal, Row, Select, Slider, Space, Table, Tag, Typography, message } from 'antd'
 import dayjs from 'dayjs'
 import type { BeeColony, ColonyStatus } from '@/types'
-import { BEE_SPECIES, BOX_TYPES, COLONY_STATUSES } from '@/types'
+import { BEE_SPECIES, BOX_TYPES, COLONY_STATUSES, colonyBoxes } from '@/types'
 import StatusTag from '@/components/common/StatusTag'
 import { usePersistentStore } from '@/hooks/usePersistentStore'
 import { colonyStore } from '@/stores/colonyStore'
 import { orchardStore } from '@/stores/orchardStore'
+import { droppointStore } from '@/stores/droppointStore'
+import { routeStore } from '@/stores/routeStore'
+import { evaluateDropPoint } from '@/utils/schedule'
 import { uid } from '@/utils/id'
 
-/** 蜂群台账：按群势与状态筛选，支持批量改状态与记录检查备注 */
+/** 蜂群台账：按群势与状态筛选，支持批量改状态与记录检查备注；技术员在此把蜂群排入投放点 */
 export default function ColoniesPage(): JSX.Element {
   const colonies = usePersistentStore(colonyStore, (state) => state.rows)
   const orchards = usePersistentStore(orchardStore, (state) => state.rows)
+  const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
+  const routes = usePersistentStore(routeStore, (state) => state.rows)
 
   const [statusFilter, setStatusFilter] = useState<ColonyStatus | ''>('')
   const [minFrames, setMinFrames] = useState(0)
@@ -22,6 +27,8 @@ export default function ColoniesPage(): JSX.Element {
   const [checkDate, setCheckDate] = useState(dayjs())
   const [modalOpen, setModalOpen] = useState(false)
   const [editing, setEditing] = useState<BeeColony | null>(null)
+  const [assignOpen, setAssignOpen] = useState(false)
+  const [assignDropId, setAssignDropId] = useState<string>('')
   const [form] = Form.useForm<{
     code: string
     species: BeeColony['species']
@@ -45,6 +52,55 @@ export default function ColoniesPage(): JSX.Element {
 
   function orchardName(id: string): string {
     return orchards.find((item) => item.id === id)?.name ?? '未分配地块'
+  }
+
+  /** 选中的蜂群与目标投放点（排入投放点弹窗） */
+  const selectedColonies = useMemo(() => colonies.filter((item) => selectedKeys.includes(item.id)), [colonies, selectedKeys])
+  const targetPoint = useMemo(() => dropPoints.find((item) => item.id === assignDropId), [dropPoints, assignDropId])
+  const selectedBoxes = useMemo(
+    () => Math.round(selectedColonies.reduce((sum, item) => sum + colonyBoxes(item), 0) * 100) / 100,
+    [selectedColonies]
+  )
+
+  /** 排入预览：把选中群追加到目标点后按两边最新数据试算，超容的群按容量排队 */
+  const assignPreview = useMemo(() => {
+    if (!targetPoint) return null
+    const merged = [...targetPoint.colonyCodes]
+    selectedColonies.forEach((colony) => {
+      if (!merged.includes(colony.code)) merged.push(colony.code)
+    })
+    return evaluateDropPoint({ ...targetPoint, colonyCodes: merged }, colonies, routes)
+  }, [targetPoint, selectedColonies, colonies, routes])
+
+  function openAssign(): void {
+    if (selectedKeys.length === 0) {
+      message.warning('请先勾选要排入投放点的蜂群')
+      return
+    }
+    if (dropPoints.length === 0) {
+      message.warning('暂无投放点，请先在果园地块管理中添加')
+      return
+    }
+    setAssignDropId(dropPoints[0]?.id ?? '')
+    setAssignOpen(true)
+  }
+
+  async function applyAssign(): Promise<void> {
+    if (!targetPoint || !assignPreview) return
+    const merged = [...targetPoint.colonyCodes]
+    selectedColonies.forEach((colony) => {
+      if (!merged.includes(colony.code)) merged.push(colony.code)
+    })
+    await droppointStore.getState().save({ ...targetPoint, colonyCodes: merged })
+    if (assignPreview.deficitBoxes > 0) {
+      message.warning(
+        `已排入 ${targetPoint.code}：容量 ${assignPreview.capacity} 箱装不下，${assignPreview.queuedCount} 群按容量排队，差 ${assignPreview.deficitBoxes} 箱`
+      )
+    } else {
+      message.success(`已把 ${selectedColonies.length} 群排入投放点 ${targetPoint.code}`)
+    }
+    setAssignOpen(false)
+    setSelectedKeys([])
   }
 
   function openCreate(): void {
@@ -165,6 +221,9 @@ export default function ColoniesPage(): JSX.Element {
                 options={COLONY_STATUSES.map((item) => ({ value: item, label: `改为 ${item}` }))}
               />
               <Button onClick={() => void applyBatchStatus()}>批量改状态</Button>
+              <Button type="primary" onClick={openAssign}>
+                排入投放点
+              </Button>
               <Input
                 style={{ width: 200 }}
                 placeholder="检查备注"
@@ -195,7 +254,13 @@ export default function ColoniesPage(): JSX.Element {
               sorter: (a: BeeColony, b: BeeColony) => a.strengthFrames - b.strengthFrames,
               render: (value: number) => `${value} 足框`
             },
-            { title: '箱型', dataIndex: 'boxType', key: 'box', width: 110 },
+            {
+              title: '箱型',
+              dataIndex: 'boxType',
+              key: 'box',
+              width: 150,
+              render: (value: BeeColony['boxType'], record: BeeColony) => `${value}（折 ${colonyBoxes(record)} 箱）`
+            },
             {
               title: '当前所在地块',
               key: 'orchard',
@@ -287,6 +352,62 @@ export default function ColoniesPage(): JSX.Element {
             </Col>
           </Row>
         </Form>
+      </Modal>
+
+      <Modal
+        title={`排入投放点（已选 ${selectedColonies.length} 群 · 折合 ${selectedBoxes} 箱）`}
+        open={assignOpen}
+        onCancel={() => setAssignOpen(false)}
+        onOk={() => void applyAssign()}
+        okText="确认排入"
+        width={640}
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size={12}>
+          <div>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              目标投放点
+            </Typography.Text>
+            <Select
+              style={{ width: '100%' }}
+              value={assignDropId}
+              onChange={(value) => setAssignDropId(value)}
+              options={dropPoints.map((point) => ({
+                value: point.id,
+                label: `${point.code}（${orchardName(point.orchardId)}）· 容量 ${point.capacityBoxes} 箱`
+              }))}
+            />
+          </div>
+          <div>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              选中蜂群（按箱型折算）
+            </Typography.Text>
+            <div>
+              <Space wrap size={4}>
+                {selectedColonies.map((colony) => (
+                  <Tag key={colony.id} color="cyan">
+                    {colony.code}（{colony.boxType} 折 {colonyBoxes(colony)} 箱）
+                  </Tag>
+                ))}
+              </Space>
+            </div>
+          </div>
+          {assignPreview ? (
+            <Alert
+              type={assignPreview.deficitBoxes > 0 ? 'warning' : 'success'}
+              showIcon
+              message={
+                assignPreview.deficitBoxes > 0
+                  ? `容量 ${assignPreview.capacity} 箱装不下：排入后占用折合 ${assignPreview.occupancyBoxes} 箱，${assignPreview.queuedCount} 群按容量排队，差 ${assignPreview.deficitBoxes} 箱`
+                  : `容量校核通过：排入后占用折合 ${assignPreview.occupancyBoxes} / ${assignPreview.capacity} 箱`
+              }
+              description={
+                assignPreview.deficitBoxes > 0
+                  ? '排队的群会保留在该投放点的安排中，托管队调高容量或技术员调整安排后自动转入正式占用。'
+                  : undefined
+              }
+            />
+          ) : null}
+        </Space>
       </Modal>
     </div>
   )

@@ -2,22 +2,30 @@ import { useStore } from 'zustand'
 import type { StoreApi, UseBoundStore } from 'zustand'
 import Dexie, { type Table } from 'dexie'
 import type { BeeColony, DropPoint, Orchard, TransitRoute } from '@/types'
+import { DEFAULT_BOX_TYPE } from '@/types'
+import { DEFAULT_DROP_CAPACITY, type ScheduleBasis } from '@/utils/schedule'
 
 /** IndexedDB 数据结构版本号 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
   value: number
 }
 
-/** Dexie 封装：果园 / 蜂群 / 投放点 / 转场路线 四张表 + 元数据表 */
+/** 排程重算基准（scheduleMeta 表，key 固定为 'basis'） */
+export interface ScheduleBasisRow extends ScheduleBasis {
+  key: string
+}
+
+/** Dexie 封装：果园 / 蜂群 / 投放点 / 转场路线 四张表 + 元数据表 + 排程基准表 */
 class BeeRouteDb extends Dexie {
   orchards!: Table<Orchard, string>
   colonies!: Table<BeeColony, string>
   dropPoints!: Table<DropPoint, string>
   routes!: Table<TransitRoute, string>
   meta!: Table<MetaRow, string>
+  scheduleMeta!: Table<ScheduleBasisRow, string>
 
   constructor() {
     super('gbbeeroute')
@@ -29,7 +37,7 @@ class BeeRouteDb extends Dexie {
       meta: 'key'
     })
     // v2：投放点新增「可容纳箱数」字段，迁移时为历史投放点补齐（按 8 箱兜底）
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         orchards: 'id, name, crop, bloomStart',
         colonies: 'id, code, status, currentOrchardId',
@@ -43,7 +51,46 @@ class BeeRouteDb extends Dexie {
           .toCollection()
           .modify((point) => {
             if (!point.capacityBoxes) {
-              point.capacityBoxes = 8
+              point.capacityBoxes = DEFAULT_DROP_CAPACITY
+            }
+          })
+      })
+    // v3：新增排程基准表；为旧数据补齐缺省值（容量 8 箱、箱型标准继箱、修订号 1）
+    this.version(SCHEMA_VERSION)
+      .stores({
+        orchards: 'id, name, crop, bloomStart',
+        colonies: 'id, code, status, currentOrchardId',
+        dropPoints: 'id, orchardId, code, dropWindow',
+        routes: 'id, fromDropId, toDropId, departAt',
+        meta: 'key',
+        scheduleMeta: 'key'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table<BeeColony, string>('colonies')
+          .toCollection()
+          .modify((colony) => {
+            if (!colony.boxType) {
+              colony.boxType = DEFAULT_BOX_TYPE
+            }
+          })
+        await tx
+          .table<DropPoint, string>('dropPoints')
+          .toCollection()
+          .modify((point) => {
+            if (!point.capacityBoxes) {
+              point.capacityBoxes = DEFAULT_DROP_CAPACITY
+            }
+            if (!point.revision) {
+              point.revision = 1
+            }
+          })
+        await tx
+          .table<Orchard, string>('orchards')
+          .toCollection()
+          .modify((orchard) => {
+            if (!orchard.revision) {
+              orchard.revision = 1
             }
           })
       })
@@ -106,7 +153,8 @@ export async function seedDemoData(): Promise<void> {
       ownerContact: '135****2043（周园主）',
       accessibility: '大车可达',
       historyYears: [year - 2, year - 1],
-      note: '主栽富士，行距 4 m，南坡'
+      note: '主栽富士，行距 4 m，南坡',
+      revision: 1
     },
     {
       id: 'orc_cherry',
@@ -121,7 +169,8 @@ export async function seedDemoData(): Promise<void> {
       ownerContact: '138****7712（李园主）',
       accessibility: '仅小车',
       historyYears: [year - 1],
-      note: '坡地梯田，需小车倒运蜂箱'
+      note: '坡地梯田，需小车倒运蜂箱',
+      revision: 1
     },
     {
       id: 'orc_rape',
@@ -136,7 +185,8 @@ export async function seedDemoData(): Promise<void> {
       ownerContact: '137****9981（合作社）',
       accessibility: '大车可达',
       historyYears: [year - 1],
-      note: '连片油菜，与苹果花期部分重叠'
+      note: '连片油菜，与苹果花期部分重叠',
+      revision: 1
     }
   ])
 
@@ -189,7 +239,8 @@ export async function seedDemoData(): Promise<void> {
       dropWindow: `${year}-04-07`,
       withdrawTime: `${year}-04-19`,
       owner: '周园主',
-      colonyCodes: ['Q-01']
+      colonyCodes: ['Q-01'],
+      revision: 1
     },
     {
       id: 'dp_b01',
@@ -203,7 +254,8 @@ export async function seedDemoData(): Promise<void> {
       dropWindow: `${year}-03-27`,
       withdrawTime: `${year}-04-13`,
       owner: '合作社',
-      colonyCodes: ['Q-02']
+      colonyCodes: ['Q-02'],
+      revision: 1
     },
     {
       id: 'dp_c01',
@@ -217,7 +269,8 @@ export async function seedDemoData(): Promise<void> {
       dropWindow: `${year}-04-11`,
       withdrawTime: `${year}-04-22`,
       owner: '李园主',
-      colonyCodes: ['Q-02']
+      colonyCodes: ['Q-02'],
+      revision: 1
     }
   ])
 

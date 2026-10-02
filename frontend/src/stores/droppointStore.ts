@@ -20,7 +20,14 @@ export const droppointStore = create<DropPointState>((set, get) => ({
     set({ rows, loaded: true })
   },
   save: async (row) => {
-    await putRow<DropPoint>(db.dropPoints, row)
+    // 托管队改了可容纳箱数 → 修订号 +1，引用本点的排程失效待重算
+    const prev = await db.dropPoints.get(row.id)
+    const revision = prev
+      ? prev.capacityBoxes !== row.capacityBoxes
+        ? (prev.revision ?? 1) + 1
+        : prev.revision ?? 1
+      : 1
+    await putRow<DropPoint>(db.dropPoints, { ...row, revision })
     await get().hydrate()
   },
   remove: async (id) => {

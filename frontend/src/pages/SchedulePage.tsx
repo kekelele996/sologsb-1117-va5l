@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
-import { Alert, Card, Col, Row, Segmented, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Col, Row, Segmented, Space, Table, Tag, Tooltip, Typography, message } from 'antd'
+import dayjs from 'dayjs'
 import type { BeeColony, DropPoint, Orchard } from '@/types'
 import FlowerWindowBar from '@/components/common/FlowerWindowBar'
 import RouteMap from '@/components/common/RouteMap'
@@ -9,7 +10,9 @@ import { orchardStore } from '@/stores/orchardStore'
 import { colonyStore } from '@/stores/colonyStore'
 import { droppointStore } from '@/stores/droppointStore'
 import { routeStore } from '@/stores/routeStore'
+import { scheduleStore } from '@/stores/scheduleStore'
 import { bloomDays, flowerWindowOverlap } from '@/utils/geo'
+import { evaluateSchedule, scheduleRowStatus, staleDropPointIds, type DropPointEval } from '@/utils/schedule'
 import { suggestColonyBoxes } from '@/types'
 
 interface Placement {
@@ -38,13 +41,33 @@ interface ScheduleRow {
   conflicted: boolean
 }
 
-/** 季内授粉安排总表：日期条带展示花期与已投放群体，冲突处标红 */
+interface OccupancyRow {
+  key: string
+  point: DropPoint
+  orchardName: string
+  eval: DropPointEval
+  stale: boolean
+}
+
+/** 季内授粉安排总表：占用按托管队（花期/投放点）与技术员（蜂群/转场）两边最新数据实时折算 */
 export default function SchedulePage(): JSX.Element {
   const orchards = usePersistentStore(orchardStore, (state) => state.rows)
   const colonies = usePersistentStore(colonyStore, (state) => state.rows)
   const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
   const routes = usePersistentStore(routeStore, (state) => state.rows)
+  const basis = usePersistentStore(scheduleStore, (state) => state.basis)
   const [scope, setScope] = useState<'all' | 'conflict'>('all')
+
+  /** 占用评估：群号 → 蜂群台账最新箱型 → 折算箱数，全部实时推导，不读历史快照 */
+  const evals = useMemo(() => evaluateSchedule(dropPoints, colonies, routes), [dropPoints, colonies, routes])
+
+  /** 托管队改动可达性 / 容量后，引用它的排程失效待重算 */
+  const staleIds = useMemo(() => staleDropPointIds(orchards, dropPoints, basis), [orchards, dropPoints, basis])
+
+  const windowIssuePoints = useMemo(
+    () => dropPoints.filter((point) => point.colonyCodes.length > 0 && evals.get(point.id)?.windowIssue),
+    [dropPoints, evals]
+  )
 
   /** 由投放点的群号安排 + 蜂群当前所在地块，汇总出「某群在某地块」的时间占用 */
   const placements = useMemo<Placement[]>(() => {
@@ -113,6 +136,19 @@ export default function SchedulePage(): JSX.Element {
     [orchards, placements, conflicts]
   )
 
+  const occupancyRows = useMemo<OccupancyRow[]>(
+    () =>
+      dropPoints.map((point) => ({
+        key: point.id,
+        point,
+        orchardName: orchardName(point.orchardId),
+        eval: evals.get(point.id) as DropPointEval,
+        stale: staleIds.has(point.id)
+      })),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [dropPoints, evals, staleIds, orchards]
+  )
+
   const visibleRows = scope === 'conflict' ? rows.filter((row) => row.conflicted) : rows
   const totalSuggest = rows.reduce((sum, row) => sum + row.suggest, 0)
 
@@ -120,24 +156,75 @@ export default function SchedulePage(): JSX.Element {
     return orchards.find((item) => item.id === id)?.name ?? '未知地块'
   }
 
+  async function recompute(): Promise<void> {
+    const next = await scheduleStore.getState().recompute()
+    message.success(`排程已按两边最新数据重算，基准时刻 ${dayjs(next.computedAt).format('YYYY-MM-DD HH:mm')}`)
+  }
+
+  const stalePoints = dropPoints.filter((point) => staleIds.has(point.id))
+
   return (
     <div className="page">
       <div className="page-head">
         <div>
           <h2 className="page-title">季内授粉安排总表</h2>
           <p className="page-sub">
-            按日期条带展示各地块盛花期与已投放群体；同一蜂群在同一天被排入花期重叠的两个地块时进入冲突列表并标红。
+            占用按托管队（花期 / 投放点容量）与技术员（蜂群箱型 / 转场顺序）两边最新数据实时折算；超容的群按容量排队并标注差几箱，赶不上投放窗的需托管队调窗口。
+            {basis ? ` 上次重算：${dayjs(basis.computedAt).format('YYYY-MM-DD HH:mm')}。` : ''}
           </p>
         </div>
-        <Segmented
-          value={scope}
-          onChange={(value) => setScope(value as 'all' | 'conflict')}
-          options={[
-            { label: `全部地块（${rows.length}）`, value: 'all' },
-            { label: `仅冲突地块（${rows.filter((row) => row.conflicted).length}）`, value: 'conflict' }
-          ]}
-        />
+        <Space>
+          <Segmented
+            value={scope}
+            onChange={(value) => setScope(value as 'all' | 'conflict')}
+            options={[
+              { label: `全部地块（${rows.length}）`, value: 'all' },
+              { label: `仅冲突地块（${rows.filter((row) => row.conflicted).length}）`, value: 'conflict' }
+            ]}
+          />
+          <Button type={staleIds.size > 0 ? 'primary' : 'default'} danger={staleIds.size > 0} onClick={() => void recompute()}>
+            {staleIds.size > 0 ? `重算排程（${staleIds.size} 处已失效）` : '重算排程'}
+          </Button>
+        </Space>
       </div>
+
+      {stalePoints.length > 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          message={`托管队调整了地块可达性或投放点容量，${stalePoints.length} 个投放点的排程已失效，重算前不得作为可执行方案导出`}
+          description={
+            <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+              {stalePoints.map((point) => (
+                <li key={point.id}>
+                  投放点 <b>{point.code}</b>（{orchardName(point.orchardId)}）· 容量 {evals.get(point.id)?.capacity ?? point.capacityBoxes} 箱 · 当前占用折合{' '}
+                  {evals.get(point.id)?.occupancyBoxes ?? 0} 箱
+                </li>
+              ))}
+            </ul>
+          }
+        />
+      ) : null}
+
+      {windowIssuePoints.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          message={`${windowIssuePoints.length} 个投放点的转场到达晚于投放窗，需托管队先调整投放窗口`}
+          description={
+            <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+              {windowIssuePoints.map((point) => {
+                const issue = evals.get(point.id)?.windowIssue
+                return (
+                  <li key={point.id}>
+                    投放点 <b>{point.code}</b>（{orchardName(point.orchardId)}）：转场预计 {issue?.arrival} 到达，晚于投放窗 {issue?.window}
+                  </li>
+                )
+              })}
+            </ul>
+          }
+        />
+      ) : null}
 
       {conflicts.length > 0 ? (
         <Alert
@@ -158,6 +245,94 @@ export default function SchedulePage(): JSX.Element {
       ) : (
         <Alert type="success" showIcon message="当前排程无蜂群冲突" />
       )}
+
+      <Card size="small" title="投放点占用明细（按两边最新数据实时折算）" style={{ marginBottom: 16 }}>
+        <Table<OccupancyRow>
+          dataSource={occupancyRows}
+          rowKey="key"
+          size="small"
+          pagination={false}
+          rowClassName={(record) => (record.stale ? 'conflict-row' : '')}
+          locale={{ emptyText: '暂无投放点' }}
+          columns={[
+            { title: '地块', dataIndex: 'orchardName', key: 'orchard' },
+            { title: '投放点', key: 'code', width: 90, render: (_, record) => <Tag color="blue">{record.point.code}</Tag> },
+            {
+              title: '占用（折合箱）',
+              key: 'occupancy',
+              width: 130,
+              render: (_, record) => {
+                const over = record.eval.occupancyBoxes > record.eval.capacity
+                return (
+                  <Typography.Text type={over ? 'danger' : undefined}>
+                    {record.eval.occupancyBoxes} / {record.eval.capacity} 箱
+                  </Typography.Text>
+                )
+              }
+            },
+            {
+              title: '安排群号（按箱型折算）',
+              key: 'codes',
+              render: (_, record) =>
+                record.eval.assignments.length > 0 ? (
+                  <Space wrap size={4}>
+                    {record.eval.assignments.map((item) =>
+                      item.known ? (
+                        <Tag key={item.code} color={item.queued ? 'orange' : 'cyan'}>
+                          {item.code}（{item.boxes} 箱）{item.queued ? '·排队' : ''}
+                        </Tag>
+                      ) : (
+                        <Tooltip key={item.code} title="蜂群台账中查不到该群号，请两边核对">
+                          <Tag color="red">{item.code}（未知群号）</Tag>
+                        </Tooltip>
+                      )
+                    )}
+                  </Space>
+                ) : (
+                  '—'
+                )
+            },
+            {
+              title: '容量缺口',
+              key: 'deficit',
+              width: 150,
+              render: (_, record) =>
+                record.eval.queuedCount > 0 ? (
+                  <Tag color="orange">
+                    排队 {record.eval.queuedCount} 群 · 差 {record.eval.deficitBoxes} 箱
+                  </Tag>
+                ) : (
+                  '—'
+                )
+            },
+            {
+              title: '投放窗',
+              key: 'window',
+              width: 190,
+              render: (_, record) => (
+                <Space size={4} wrap>
+                  <span>{record.point.dropWindow || '—'}</span>
+                  {record.eval.windowIssue ? (
+                    <Tooltip title={`转场预计 ${record.eval.windowIssue.arrival} 到达，晚于投放窗`}>
+                      <Tag color="gold">需托管队调窗口</Tag>
+                    </Tooltip>
+                  ) : null}
+                </Space>
+              )
+            },
+            {
+              title: '状态',
+              key: 'status',
+              width: 200,
+              render: (_, record) => {
+                const text = scheduleRowStatus(record.eval, record.stale)
+                const color = record.stale ? 'red' : text === '正常' ? 'green' : 'orange'
+                return <Tag color={color}>{text}</Tag>
+              }
+            }
+          ]}
+        />
+      </Card>
 
       <Row gutter={16}>
         <Col xs={24} xl={14}>

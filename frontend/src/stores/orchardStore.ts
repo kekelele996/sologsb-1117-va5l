@@ -19,7 +19,14 @@ export const orchardStore = create<OrchardState>((set, get) => ({
     set({ rows, loaded: true })
   },
   save: async (row) => {
-    await putRow<Orchard>(db.orchards, row)
+    // 托管队改了可达性 → 修订号 +1，引用本地块的排程失效待重算
+    const prev = await db.orchards.get(row.id)
+    const revision = prev
+      ? prev.accessibility !== row.accessibility
+        ? (prev.revision ?? 1) + 1
+        : prev.revision ?? 1
+      : 1
+    await putRow<Orchard>(db.orchards, { ...row, revision })
     await get().hydrate()
   },
   remove: async (id) => {
