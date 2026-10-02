@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Alert, Card, Col, Row, Segmented, Space, Table, Tag, Typography } from 'antd'
+import { Alert, Button, Card, Col, Row, Segmented, Space, Table, Tag, Typography, message } from 'antd'
 import type { BeeColony, DropPoint, Orchard } from '@/types'
 import FlowerWindowBar from '@/components/common/FlowerWindowBar'
 import RouteMap from '@/components/common/RouteMap'
@@ -9,8 +9,10 @@ import { orchardStore } from '@/stores/orchardStore'
 import { colonyStore } from '@/stores/colonyStore'
 import { droppointStore } from '@/stores/droppointStore'
 import { routeStore } from '@/stores/routeStore'
+import { scheduleStore } from '@/stores/scheduleStore'
 import { bloomDays, flowerWindowOverlap } from '@/utils/geo'
 import { suggestColonyBoxes } from '@/types'
+import { planAllDropPoints, type DropPointPlan } from '@/utils/schedule'
 
 interface Placement {
   colonyCode: string
@@ -44,7 +46,33 @@ export default function SchedulePage(): JSX.Element {
   const colonies = usePersistentStore(colonyStore, (state) => state.rows)
   const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
   const routes = usePersistentStore(routeStore, (state) => state.rows)
+  const scheduleValid = usePersistentStore(scheduleStore, (state) => state.valid)
+  const staleReasons = usePersistentStore(scheduleStore, (state) => state.staleReasons)
+  const lastRecalcAt = usePersistentStore(scheduleStore, (state) => state.lastRecalcAt)
   const [scope, setScope] = useState<'all' | 'conflict'>('all')
+  const [recalculating, setRecalculating] = useState(false)
+
+  /** 投放点容量核对：按箱型折箱，装不下排队并写明差几箱，赶不上窗的提示调窗口 */
+  const dropPlans = useMemo<DropPointPlan[]>(
+    () => planAllDropPoints(dropPoints, colonies, orchards),
+    [dropPoints, colonies, orchards]
+  )
+  const overCapacityCount = dropPlans.filter((plan) => plan.shortfallBoxes > 0).length
+  const windowIssueCount = dropPlans.reduce((sum, plan) => sum + plan.windowIssues.length, 0)
+
+  async function recalculate(): Promise<void> {
+    setRecalculating(true)
+    try {
+      const { issues } = await scheduleStore.getState().recalculate()
+      if (issues.length === 0) {
+        message.success('已按托管队与技术员最新一版数据重算，排程可执行')
+      } else {
+        message.warning(`重算完成：${overCapacityCount} 个投放点超容、${windowIssueCount} 群赶不上投放窗，请先排队或让托管队调窗口`)
+      }
+    } finally {
+      setRecalculating(false)
+    }
+  }
 
   /** 由投放点的群号安排 + 蜂群当前所在地块，汇总出「某群在某地块」的时间占用 */
   const placements = useMemo<Placement[]>(() => {
@@ -139,6 +167,71 @@ export default function SchedulePage(): JSX.Element {
         />
       </div>
 
+      {scheduleValid ? (
+        <Alert
+          type="success"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={
+            <span>
+              排程已按托管队（花期 / 投放点）与技术员（蜂群 / 转场顺序）最新一版数据重算
+              {lastRecalcAt ? `（重算时间 ${lastRecalcAt.replace('T', ' ').slice(0, 16)}）` : ''}
+              ，可作为可执行方案导出。
+            </span>
+          }
+        />
+      ) : (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="排程已失效：托管队更新了地块可达性或投放点容量，引用处需按最新数据重算"
+          description={
+            <div>
+              <ul style={{ margin: '4px 0 8px', paddingLeft: 18 }}>
+                {staleReasons.map((item) => (
+                  <li key={`${item.kind}-${item.refId}`}>{item.label}</li>
+                ))}
+              </ul>
+              <Space>
+                <Button type="primary" size="small" loading={recalculating} onClick={() => void recalculate()}>
+                  重算排程
+                </Button>
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  重算完成前，导出与打印将被拦截，不能作为可执行方案。
+                </Typography.Text>
+              </Space>
+            </div>
+          }
+        />
+      )}
+
+      {overCapacityCount > 0 || windowIssueCount > 0 ? (
+        <Alert
+          type="error"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message={`容量 / 窗口核对：${overCapacityCount} 个投放点超容，${windowIssueCount} 群赶不上投放窗`}
+          description={
+            <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+              {dropPlans
+                .filter((plan) => plan.shortfallBoxes > 0)
+                .map((plan) => (
+                  <li key={`cap-${plan.dropPoint.id}`}>
+                    投放点 <b>{plan.dropPoint.code}</b>（{orchardName(plan.dropPoint.orchardId)}）：需 {plan.demandBoxes} 箱 / 容 {plan.capacityBoxes} 箱，
+                    差 <b>{plan.shortfallBoxes}</b> 箱；排队蜂群：{plan.queued.map((q) => q.colony.code).join('、')}
+                  </li>
+                ))}
+              {dropPlans.flatMap((plan) =>
+                plan.windowIssues.map((issue) => (
+                  <li key={`win-${plan.dropPoint.id}-${issue.colony.id}`}>{issue.reason}</li>
+                ))
+              )}
+            </ul>
+          }
+        />
+      ) : null}
+
       {conflicts.length > 0 ? (
         <Alert
           type="error"
@@ -232,7 +325,66 @@ export default function SchedulePage(): JSX.Element {
         />
       </Card>
 
-      <Card size="small" title="蜂群当前状态">
+      <Card size="small" title="投放点容量核对（箱型折箱 · 装不下按容量排队并写明差几箱）" style={{ marginTop: 16 }}>
+        <Table<DropPointPlan>
+          dataSource={dropPlans}
+          rowKey={(plan) => plan.dropPoint.id}
+          pagination={false}
+          rowClassName={(plan) => (plan.shortfallBoxes > 0 || plan.windowIssues.length > 0 ? 'conflict-row' : '')}
+          columns={[
+            { title: '投放点', key: 'code', width: 90, render: (_, plan) => <Tag color="blue">{plan.dropPoint.code}</Tag> },
+            { title: '所属地块', key: 'orchard', render: (_, plan) => orchardName(plan.dropPoint.orchardId) },
+            { title: '容量（箱）', dataIndex: ['capacityBoxes'], key: 'cap', width: 90 },
+            {
+              title: '已排入',
+              key: 'assigned',
+              width: 90,
+              render: (_, plan) => `${plan.usedBoxes} 箱 / ${plan.assigned.length} 群`
+            },
+            {
+              title: '排队（装不下）',
+              key: 'queued',
+              render: (_, plan) =>
+                plan.queued.length > 0 ? (
+                  <Space wrap size={4}>
+                    {plan.queued.map((q) => (
+                      <Tag key={q.colony.id} color="orange">
+                        {q.colony.code}（{q.boxes} 箱）
+                      </Tag>
+                    ))}
+                  </Space>
+                ) : (
+                  '—'
+                )
+            },
+            {
+              title: '差几箱',
+              key: 'shortfall',
+              width: 90,
+              render: (_, plan) =>
+                plan.shortfallBoxes > 0 ? <Tag color="red">差 {plan.shortfallBoxes} 箱</Tag> : <Tag color="green">装得下</Tag>
+            },
+            {
+              title: '投放窗提示',
+              key: 'window',
+              render: (_, plan) =>
+                plan.windowIssues.length > 0 ? (
+                  <Space direction="vertical" size={2}>
+                    {plan.windowIssues.map((issue) => (
+                      <Typography.Text key={issue.colony.id} type="warning" style={{ fontSize: 12 }}>
+                        {issue.colony.code} 赶不上 {plan.dropPoint.dropWindow} 窗，需托管队先调窗口
+                      </Typography.Text>
+                    ))}
+                  </Space>
+                ) : (
+                  '—'
+                )
+            }
+          ]}
+        />
+      </Card>
+
+      <Card size="small" title="蜂群当前状态" style={{ marginTop: 16 }}>
         <Space wrap>
           {colonies.map((colony) => (
             <StatusTag

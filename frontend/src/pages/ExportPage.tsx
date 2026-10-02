@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Button, Card, Col, Radio, Row, Space, Table, Tag, Typography, message } from 'antd'
+import { Alert, Button, Card, Col, Radio, Row, Space, Table, Tag, Typography, message } from 'antd'
 import dayjs from 'dayjs'
 import type { BeeColony, DropPoint, Orchard, TransitRoute } from '@/types'
 import { suggestColonyBoxes } from '@/types'
@@ -8,8 +8,10 @@ import { orchardStore } from '@/stores/orchardStore'
 import { colonyStore } from '@/stores/colonyStore'
 import { droppointStore } from '@/stores/droppointStore'
 import { routeStore } from '@/stores/routeStore'
+import { scheduleStore } from '@/stores/scheduleStore'
 import { downloadCsv, downloadJson } from '@/utils/export'
 import { bloomDays } from '@/utils/geo'
+import { planDropPoint, colonyBoxes } from '@/utils/schedule'
 
 interface ScheduleExportRow {
   orchard: string
@@ -23,6 +25,10 @@ interface ScheduleExportRow {
   dropWindow: string
   withdrawTime: string
   owner: string
+  capacityBoxes: number
+  colonyBoxes: number
+  queued: string
+  shortfallBoxes: number
 }
 
 /** 导出授粉安排清单与转场路线表，并提供打印视图 */
@@ -31,11 +37,12 @@ export default function ExportPage(): JSX.Element {
   const colonies = usePersistentStore(colonyStore, (state) => state.rows)
   const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
   const routes = usePersistentStore(routeStore, (state) => state.rows)
+  const scheduleValid = usePersistentStore(scheduleStore, (state) => state.valid)
   const [orientation, setOrientation] = useState<'portrait' | 'landscape'>('landscape')
 
   const orchardName = (id: string): string => orchards.find((item) => item.id === id)?.name ?? '未知地块'
 
-  /** 授粉安排清单：地块 × 投放点 × 群号 */
+  /** 授粉安排清单：地块 × 投放点 × 群号（含容量 / 折箱 / 排队 / 差几箱，按最新排程） */
   const scheduleRows = useMemo<ScheduleExportRow[]>(() => {
     const rows: ScheduleExportRow[] = []
     orchards.forEach((orchard: Orchard) => {
@@ -49,10 +56,14 @@ export default function ExportPage(): JSX.Element {
         suggestBoxes: suggestColonyBoxes(orchard)
       }
       if (points.length === 0) {
-        rows.push({ ...base, dropCode: '—', colonyCode: '—', dropWindow: '—', withdrawTime: '—', owner: '—' })
+        rows.push({ ...base, dropCode: '—', colonyCode: '—', dropWindow: '—', withdrawTime: '—', owner: '—', capacityBoxes: 0, colonyBoxes: 0, queued: '—', shortfallBoxes: 0 })
         return
       }
       points.forEach((point: DropPoint) => {
+        const plan = planDropPoint(point, colonies, orchards)
+        const queuedCodes = plan.queued.map((q) => q.colony.code)
+        const capacity = plan.capacityBoxes
+        const shortfall = plan.shortfallBoxes
         if (point.colonyCodes.length === 0) {
           rows.push({
             ...base,
@@ -60,24 +71,34 @@ export default function ExportPage(): JSX.Element {
             colonyCode: '待分配',
             dropWindow: point.dropWindow,
             withdrawTime: point.withdrawTime,
-            owner: point.owner || '—'
+            owner: point.owner || '—',
+            capacityBoxes: capacity,
+            colonyBoxes: 0,
+            queued: '—',
+            shortfallBoxes: shortfall
           })
           return
         }
         point.colonyCodes.forEach((code) => {
+          const colony = colonies.find((item) => item.code === code)
+          const isQueued = queuedCodes.includes(code)
           rows.push({
             ...base,
             dropCode: point.code,
             colonyCode: code,
             dropWindow: point.dropWindow,
             withdrawTime: point.withdrawTime,
-            owner: point.owner || '—'
+            owner: point.owner || '—',
+            capacityBoxes: capacity,
+            colonyBoxes: colony ? colonyBoxes(colony) : 0,
+            queued: isQueued ? '排队' : '排入',
+            shortfallBoxes: shortfall
           })
         })
       })
     })
     return rows
-  }, [orchards, dropPoints])
+  }, [orchards, dropPoints, colonies])
 
   const routeRows = useMemo(
     () =>
@@ -99,7 +120,14 @@ export default function ExportPage(): JSX.Element {
     [routes, dropPoints, orchards]
   )
 
+  function ensureRecalculated(): boolean {
+    if (scheduleValid) return true
+    message.warning('排程尚未按托管队 / 技术员最新一版数据重算，不能作为可执行方案导出，请先在「季内授粉安排总表」重算')
+    return false
+  }
+
   function exportSchedule(): void {
+    if (!ensureRecalculated()) return
     downloadCsv('授粉安排清单.csv', scheduleRows as unknown as Record<string, unknown>[], [
       { key: 'orchard', label: '地块' },
       { key: 'crop', label: '作物' },
@@ -111,12 +139,17 @@ export default function ExportPage(): JSX.Element {
       { key: 'colonyCode', label: '群号' },
       { key: 'dropWindow', label: '投放时间窗' },
       { key: 'withdrawTime', label: '撤场时间' },
-      { key: 'owner', label: '责任人' }
+      { key: 'owner', label: '责任人' },
+      { key: 'capacityBoxes', label: '投放点容量(箱)' },
+      { key: 'colonyBoxes', label: '该群折箱(箱)' },
+      { key: 'queued', label: '是否排队' },
+      { key: 'shortfallBoxes', label: '差几箱' }
     ])
     message.success('授粉安排清单已导出')
   }
 
   function exportRoutes(): void {
+    if (!ensureRecalculated()) return
     downloadCsv('转场路线表.csv', routeRows as unknown as Record<string, unknown>[], [
       { key: 'from', label: '出发投放点' },
       { key: 'to', label: '到达投放点' },
@@ -162,11 +195,14 @@ export default function ExportPage(): JSX.Element {
 
       <Card size="small">
         <Space wrap>
-          <Button type="primary" onClick={exportSchedule}>
+          <Button type="primary" onClick={exportSchedule} disabled={!scheduleValid}>
             导出授粉安排清单（CSV）
           </Button>
-          <Button onClick={exportRoutes}>导出转场路线表（CSV）</Button>
+          <Button onClick={exportRoutes} disabled={!scheduleValid}>导出转场路线表（CSV）</Button>
           <Button onClick={exportBackup}>导出全量 JSON 备份</Button>
+          <Button onClick={() => (scheduleValid ? window.print() : ensureRecalculated())} disabled={!scheduleValid}>
+            打印视图
+          </Button>
           <Tag>地块 {orchards.length}</Tag>
           <Tag>蜂群 {colonies.length}</Tag>
           <Tag>投放点 {dropPoints.length}</Tag>
@@ -176,6 +212,16 @@ export default function ExportPage(): JSX.Element {
           </Typography.Text>
         </Space>
       </Card>
+
+      {!scheduleValid ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginTop: 12 }}
+          message="排程尚未按托管队 / 技术员最新一版数据重算，授粉安排清单与转场路线表暂不能作为可执行方案导出"
+          description="请先到「季内授粉安排总表」点击「重算排程」，重算完成后导出与打印将自动放行。全量 JSON 备份为原始数据，不受此限制。"
+        />
+      ) : null}
 
       <div className={orientation === 'landscape' ? 'print-landscape' : 'print-portrait'}>
         <Card size="small" title={`授粉安排清单（${scheduleRows.length} 行）`} style={{ marginBottom: 16 }}>
@@ -195,7 +241,23 @@ export default function ExportPage(): JSX.Element {
               { title: '群号', dataIndex: 'colonyCode', key: 'colony', width: 90 },
               { title: '投放时间窗', dataIndex: 'dropWindow', key: 'window' },
               { title: '撤场时间', dataIndex: 'withdrawTime', key: 'withdraw' },
-              { title: '责任人', dataIndex: 'owner', key: 'owner' }
+              { title: '责任人', dataIndex: 'owner', key: 'owner' },
+              { title: '容量(箱)', dataIndex: 'capacityBoxes', key: 'cap', width: 80 },
+              { title: '折箱(箱)', dataIndex: 'colonyBoxes', key: 'boxes', width: 80 },
+              {
+                title: '排队',
+                dataIndex: 'queued',
+                key: 'queued',
+                width: 70,
+                render: (value: string) => (value === '排队' ? <Tag color="orange">排队</Tag> : value === '排入' ? <Tag color="green">排入</Tag> : '—')
+              },
+              {
+                title: '差几箱',
+                dataIndex: 'shortfallBoxes',
+                key: 'shortfall',
+                width: 80,
+                render: (value: number) => (value > 0 ? <Tag color="red">差 {value} 箱</Tag> : '—')
+              }
             ]}
           />
         </Card>

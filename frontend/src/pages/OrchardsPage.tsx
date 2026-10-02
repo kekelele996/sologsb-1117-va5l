@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Button, Card, Col, DatePicker, Form, Input, InputNumber, Modal, Row, Select, Space, Table, Tag, Typography, message } from 'antd'
+import { Alert, Button, Card, Col, DatePicker, Form, Input, InputNumber, Modal, Row, Select, Space, Table, Tag, Typography, message } from 'antd'
 import dayjs from 'dayjs'
 import type { DropPoint, Orchard } from '@/types'
 import { ACCESSIBILITIES, CROPS, suggestColonyBoxes } from '@/types'
@@ -10,6 +10,7 @@ import { orchardStore } from '@/stores/orchardStore'
 import { droppointStore } from '@/stores/droppointStore'
 import { colonyStore } from '@/stores/colonyStore'
 import { bloomDays } from '@/utils/geo'
+import { planDropPoint } from '@/utils/schedule'
 import { uid } from '@/utils/id'
 
 interface OrchardFormValues {
@@ -57,6 +58,30 @@ export default function OrchardsPage(): JSX.Element {
     areaMu: Number(watchedArea) || 0,
     colonyIntensity: Number(watchedIntensity) || 0
   })
+
+  // 投放点表单实时预览：按箱型折箱核对容量、排队与投放窗
+  const watchedDropCodes = Form.useWatch('colonyCodes', dropForm) as string[] | undefined
+  const watchedDropCapacity = Form.useWatch('capacityBoxes', dropForm) as number | undefined
+  const watchedDropWindow = Form.useWatch('dropWindow', dropForm) as dayjs.Dayjs | undefined
+  const dropPreview = useMemo(() => {
+    if (!dropOwner) return null
+    const point: DropPoint = {
+      id: 'preview',
+      orchardId: dropOwner.id,
+      longitude: dropCoord.longitude,
+      latitude: dropCoord.latitude,
+      code: (dropForm.getFieldValue('code') as string) ?? '',
+      capacityBoxes: Number(watchedDropCapacity) || 0,
+      shade: '',
+      waterDistance: 0,
+      dropWindow: watchedDropWindow ? watchedDropWindow.format('YYYY-MM-DD') : '',
+      withdrawTime: '',
+      owner: '',
+      colonyCodes: watchedDropCodes ?? []
+    }
+    return planDropPoint(point, colonies, orchards)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dropOwner, dropCoord, watchedDropCodes, watchedDropCapacity, watchedDropWindow, colonies, orchards])
 
   const dropsOf = useMemo(
     () => (orchardId: string): DropPoint[] => dropPoints.filter((item) => item.orchardId === orchardId),
@@ -357,10 +382,40 @@ export default function OrchardsPage(): JSX.Element {
             </Col>
             <Col span={24}>
               <Form.Item name="colonyCodes" label="安排群号（同一群跨地块重叠即冲突）">
-                <Select mode="multiple" options={colonies.map((item) => ({ value: item.code, label: `${item.code}（${item.species} ${item.strengthFrames} 足框）` }))} />
+                <Select mode="multiple" options={colonies.map((item) => ({ value: item.code, label: `${item.code}（${item.species} ${item.strengthFrames} 足框 · ${item.boxType}）` }))} />
               </Form.Item>
             </Col>
           </Row>
+
+          {dropPreview && dropPreview.assigned.length + dropPreview.queued.length > 0 ? (
+            <Alert
+              type={dropPreview.shortfallBoxes > 0 || dropPreview.windowIssues.length > 0 ? 'warning' : 'success'}
+              showIcon
+              style={{ marginBottom: 12 }}
+              message={
+                <span>
+                  已选 {dropPreview.assigned.length + dropPreview.queued.length} 群，按箱型折箱合计 {dropPreview.demandBoxes} 箱 / 容量 {dropPreview.capacityBoxes} 箱
+                  {dropPreview.shortfallBoxes > 0 ? (
+                    <>
+                      ，装不下需排队：<b>{dropPreview.queued.map((q) => q.colony.code).join('、')}</b>，差 <b>{dropPreview.shortfallBoxes}</b> 箱
+                    </>
+                  ) : (
+                    '，容量充足'
+                  )}
+                </span>
+              }
+              description={
+                dropPreview.windowIssues.length > 0 ? (
+                  <ul style={{ margin: '4px 0 0', paddingLeft: 18 }}>
+                    {dropPreview.windowIssues.map((issue) => (
+                      <li key={issue.colony.id}>{issue.reason}</li>
+                    ))}
+                  </ul>
+                ) : undefined
+              }
+            />
+          ) : null}
+
           <Form.Item label="经纬度">
             <CoordPicker value={dropCoord} onChange={setDropCoord} orchards={orchards} dropPoints={dropPoints} />
           </Form.Item>

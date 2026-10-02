@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type { DropPoint } from '@/types'
 import { db, deleteRow, loadAll, putRow } from '@/hooks/usePersistentStore'
+import { scheduleStore } from '@/stores/scheduleStore'
 
 export interface DropPointState {
   rows: DropPoint[]
@@ -20,7 +21,16 @@ export const droppointStore = create<DropPointState>((set, get) => ({
     set({ rows, loaded: true })
   },
   save: async (row) => {
+    const prev = await db.dropPoints.get(row.id)
     await putRow<DropPoint>(db.dropPoints, row)
+    // 托管队改了投放点容量 → 引用它的排程失效，需重算
+    if (prev && prev.capacityBoxes !== row.capacityBoxes) {
+      scheduleStore.getState().notifyHostingChange({
+        kind: 'droppoint-capacity',
+        refId: row.id,
+        label: `投放点「${row.code}」容量改为 ${row.capacityBoxes} 箱`
+      })
+    }
     await get().hydrate()
   },
   remove: async (id) => {

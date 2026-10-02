@@ -4,11 +4,14 @@ import Dexie, { type Table } from 'dexie'
 import type { BeeColony, DropPoint, Orchard, TransitRoute } from '@/types'
 
 /** IndexedDB 数据结构版本号 */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
+
+/** 排程有效性状态在 meta 表中的存储键 */
+export const SCHEDULE_META_KEY = 'scheduleState'
 
 export interface MetaRow {
   key: string
-  value: number
+  value: number | string
 }
 
 /** Dexie 封装：果园 / 蜂群 / 投放点 / 转场路线 四张表 + 元数据表 */
@@ -29,7 +32,7 @@ class BeeRouteDb extends Dexie {
       meta: 'key'
     })
     // v2：投放点新增「可容纳箱数」字段，迁移时为历史投放点补齐（按 8 箱兜底）
-    this.version(SCHEMA_VERSION)
+    this.version(2)
       .stores({
         orchards: 'id, name, crop, bloomStart',
         colonies: 'id, code, status, currentOrchardId',
@@ -42,10 +45,53 @@ class BeeRouteDb extends Dexie {
           .table<DropPoint, string>('dropPoints')
           .toCollection()
           .modify((point) => {
-            if (!point.capacityBoxes) {
+            if (!point.capacityBoxes || point.capacityBoxes <= 0) {
               point.capacityBoxes = 8
             }
           })
+      })
+    // v3：旧数据升级后补齐缺失的投放点容量与蜂群箱型（默认 8 箱 / 标准继箱），
+    // 并把历史排程标记为待重算（容量、箱型变化后需按最新数据重算，重算完前不得导出为可执行方案）
+    this.version(SCHEMA_VERSION)
+      .stores({
+        orchards: 'id, name, crop, bloomStart',
+        colonies: 'id, code, status, currentOrchardId, boxType',
+        dropPoints: 'id, orchardId, code, dropWindow, capacityBoxes',
+        routes: 'id, fromDropId, toDropId, departAt',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table<DropPoint, string>('dropPoints')
+          .toCollection()
+          .modify((point) => {
+            if (!point.capacityBoxes || point.capacityBoxes <= 0) {
+              point.capacityBoxes = 8
+            }
+          })
+        await tx
+          .table<BeeColony, string>('colonies')
+          .toCollection()
+          .modify((colony) => {
+            if (!colony.boxType) {
+              colony.boxType = '标准继箱'
+            }
+          })
+        await tx.table<MetaRow, string>('meta').put({
+          key: SCHEDULE_META_KEY,
+          value: JSON.stringify({
+            valid: false,
+            staleReasons: [
+              {
+                kind: 'migration',
+                refId: 'v3',
+                label: '数据已升级：投放点容量 / 蜂群箱型已按默认值补齐，请重算排程后再导出',
+                at: new Date().toISOString()
+              }
+            ],
+            lastRecalcAt: null
+          })
+        })
       })
   }
 }
@@ -55,6 +101,17 @@ export const db = new BeeRouteDb()
 /** 写入当前数据结构版本号 */
 export async function stampDbVersion(): Promise<void> {
   await db.meta.put({ key: 'schemaVersion', value: SCHEMA_VERSION })
+}
+
+/** 读取 meta 表中的字符串值（如排程状态） */
+export async function loadMetaString(key: string): Promise<string | null> {
+  const row = await db.meta.get(key)
+  return row && typeof row.value === 'string' ? row.value : null
+}
+
+/** 写入 meta 表字符串值 */
+export async function saveMetaString(key: string, value: string): Promise<void> {
+  await db.meta.put({ key, value })
 }
 
 /** 读取整表 */
@@ -234,4 +291,10 @@ export async function seedDemoData(): Promise<void> {
       actualNote: '待执行'
     }
   ])
+
+  // 首次写入示例数据后，排程视为已按最新数据重算
+  await saveMetaString(
+    SCHEDULE_META_KEY,
+    JSON.stringify({ valid: true, staleReasons: [], lastRecalcAt: new Date().toISOString() })
+  )
 }

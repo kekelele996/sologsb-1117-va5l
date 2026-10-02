@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import type { BeeColony, ColonyStatus } from '@/types'
 import { db, deleteRow, loadAll, putRow } from '@/hooks/usePersistentStore'
+import { scheduleStore } from '@/stores/scheduleStore'
 
 export interface ColonyState {
   rows: BeeColony[]
@@ -21,7 +22,16 @@ export const colonyStore = create<ColonyState>((set, get) => ({
     set({ rows, loaded: true })
   },
   save: async (row) => {
+    const prev = await db.colonies.get(row.id)
     await putRow<BeeColony>(db.colonies, row)
+    // 技术员改了蜂群箱型 → 折箱数变化，引用它的排程失效，需重算
+    if (prev && prev.boxType !== row.boxType) {
+      scheduleStore.getState().notifyTechnicianChange({
+        kind: 'colony-boxtype',
+        refId: row.id,
+        label: `蜂群「${row.code}」箱型改为「${row.boxType}」`
+      })
+    }
     await get().hydrate()
   },
   remove: async (id) => {

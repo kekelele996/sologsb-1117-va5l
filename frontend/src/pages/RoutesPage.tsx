@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Button, Card, Col, DatePicker, Empty, Form, Input, Row, Select, Space, Table, Tag, Typography, message } from 'antd'
+import { Alert, Button, Card, Col, DatePicker, Empty, Form, Input, Row, Select, Space, Table, Tag, Typography, message } from 'antd'
 import dayjs from 'dayjs'
 import type { DropPoint, TransitRoute } from '@/types'
 import { VEHICLE_TYPES } from '@/types'
@@ -8,6 +8,7 @@ import { usePersistentStore } from '@/hooks/usePersistentStore'
 import { orchardStore } from '@/stores/orchardStore'
 import { droppointStore } from '@/stores/droppointStore'
 import { routeStore } from '@/stores/routeStore'
+import { scheduleStore } from '@/stores/scheduleStore'
 import { distanceKm, estimateDurationH, routeLegs } from '@/utils/geo'
 
 /** 转场路线规划：地图上依次选点生成顺序与里程，支持拖动调整顺序并重算 */
@@ -15,6 +16,9 @@ export default function RoutesPage(): JSX.Element {
   const orchards = usePersistentStore(orchardStore, (state) => state.rows)
   const dropPoints = usePersistentStore(droppointStore, (state) => state.rows)
   const routes = usePersistentStore(routeStore, (state) => state.rows)
+  const scheduleValid = usePersistentStore(scheduleStore, (state) => state.valid)
+  const staleReasons = usePersistentStore(scheduleStore, (state) => state.staleReasons)
+  const [recalculating, setRecalculating] = useState(false)
 
   const [orderedIds, setOrderedIds] = useState<string[]>([])
   const [draggingId, setDraggingId] = useState<string | null>(null)
@@ -79,6 +83,20 @@ export default function RoutesPage(): JSX.Element {
     message.success(`已生成 ${orderedIds.length - 1} 段转场路线，累计 ${legs.total} km`)
   }
 
+  async function recalculateSchedule(): Promise<void> {
+    setRecalculating(true)
+    try {
+      const { issues } = await scheduleStore.getState().recalculate()
+      if (issues.length === 0) {
+        message.success('已按最新数据重算，路线可执行')
+      } else {
+        message.warning(`重算完成：${issues.length} 个投放点仍有超容或投放窗问题`)
+      }
+    } finally {
+      setRecalculating(false)
+    }
+  }
+
   return (
     <div className="page">
       <div className="page-head">
@@ -95,6 +113,27 @@ export default function RoutesPage(): JSX.Element {
           </Button>
         </Space>
       </div>
+
+      {!scheduleValid ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="排程已失效：路线引用的地块可达性或投放点容量已被托管队修改"
+          description={
+            <Space direction="vertical" size={4}>
+              <ul style={{ margin: '4px 0', paddingLeft: 18 }}>
+                {staleReasons.map((item) => (
+                  <li key={`${item.kind}-${item.refId}`}>{item.label}</li>
+                ))}
+              </ul>
+              <Button size="small" type="primary" loading={recalculating} onClick={() => void recalculateSchedule()}>
+                重算排程
+              </Button>
+            </Space>
+          }
+        />
+      ) : null}
 
       <Row gutter={16}>
         <Col xs={24} xl={15}>
